@@ -54,29 +54,51 @@ public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin {
                 let session = ASWebAuthenticationSession(url: url, callbackURLScheme: callbackURLScheme, completionHandler: completionHandler)
 
                 if #available(iOS 13, *) {
-                    // Obtener la ventana activa correctamente para iOS 13+
-                    var presentationContext: ASWebAuthenticationPresentationContextProviding?
-
+                    // SOLUCIÓN: Buscar correctamente el FlutterViewController
+                    var flutterViewController: FlutterViewController?
+                    
                     if #available(iOS 15, *) {
-                        // Para iOS 15+ usar el método más moderno
-                        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                           let window = windowScene.windows.first,
-                           let rootVC = window.rootViewController {
-                            presentationContext = rootVC as? ASWebAuthenticationPresentationContextProviding
+                        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
+                            for window in windowScene.windows {
+                                if let rootVC = window.rootViewController as? FlutterViewController {
+                                    flutterViewController = rootVC
+                                    break
+                                }
+                                // Buscar en view controllers presentados
+                                var currentVC = window.rootViewController
+                                while currentVC != nil {
+                                    if let flutterVC = currentVC as? FlutterViewController {
+                                        flutterViewController = flutterVC
+                                        break
+                                    }
+                                    currentVC = currentVC?.presentedViewController
+                                }
+                            }
                         }
                     } else {
-                        // Para iOS 13-14
-                        if let window = UIApplication.shared.windows.first,
-                           let rootVC = window.rootViewController {
-                            presentationContext = rootVC as? ASWebAuthenticationPresentationContextProviding
+                        // iOS 13-14
+                        for window in UIApplication.shared.windows {
+                            if let rootVC = window.rootViewController as? FlutterViewController {
+                                flutterViewController = rootVC
+                                break
+                            }
+                            // Buscar en view controllers presentados
+                            var currentVC = window.rootViewController
+                            while currentVC != nil {
+                                if let flutterVC = currentVC as? FlutterViewController {
+                                    flutterViewController = flutterVC
+                                    break
+                                }
+                                currentVC = currentVC?.presentedViewController
+                            }
                         }
                     }
-
-                    guard let contextProvider = presentationContext else {
+                    
+                    guard let contextProvider = flutterViewController else {
                         result(FlutterError.aquireRootViewControllerFailed)
                         return
                     }
-
+                    
                     session.presentationContextProvider = contextProvider
                     session.prefersEphemeralWebBrowserSession = preferEphemeral
                 }
@@ -113,7 +135,22 @@ public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin {
 @available(iOS 13, *)
 extension FlutterViewController: ASWebAuthenticationPresentationContextProviding {
     public func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        return self.view.window ?? UIWindow()
+        // Asegurar que devolvemos una ventana válida
+        guard let window = self.view.window else {
+            // Si no hay ventana, buscar la primera ventana disponible
+            if #available(iOS 15, *) {
+                if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                   let firstWindow = windowScene.windows.first {
+                    return firstWindow
+                }
+            } else {
+                if let firstWindow = UIApplication.shared.windows.first {
+                    return firstWindow
+                }
+            }
+            return UIWindow()
+        }
+        return window
     }
 }
 
