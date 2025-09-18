@@ -19,7 +19,7 @@ public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin {
            let preferEphemeral = arguments["preferEphemeral"] as? Bool
         {
 
-            var sessionToKeepAlive: Any? = nil // if we do not keep the session alive, it will get closed immediately while showing the dialog
+            var sessionToKeepAlive: Any? = nil
             let completionHandler = { (url: URL?, err: Error?) in
                 sessionToKeepAlive = nil
 
@@ -54,36 +54,30 @@ public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin {
                 let session = ASWebAuthenticationSession(url: url, callbackURLScheme: callbackURLScheme, completionHandler: completionHandler)
 
                 if #available(iOS 13, *) {
-                    // FIX para iOS 18+ - usar UIWindowScene en lugar de keyWindow deprecado
-                    guard let windowScene = UIApplication.shared.connectedScenes
-                        .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene,
-                        let window = windowScene.windows.first(where: { $0.isKeyWindow }),
-                        var topController = window.rootViewController else {
-                        result(FlutterError.aquireRootViewControllerFailed)
-                        return
-                    }
+                    // Obtener la ventana activa correctamente para iOS 13+
+                    var presentationContext: ASWebAuthenticationPresentationContextProviding?
 
-                    while let presentedViewController = topController.presentedViewController {
-                        topController = presentedViewController
-                    }
-                    if let nav = topController as? UINavigationController {
-                        topController = nav.visibleViewController ?? topController
-                    }
-
-                    // Intentar usar FlutterViewController directamente primero
-                    if let flutterViewController = window.rootViewController as? FlutterViewController {
-                        // Configurar para que no cubra el status bar
-                        flutterViewController.modalPresentationStyle = .pageSheet
-                        session.presentationContextProvider = flutterViewController
-                    } else if let contextProvider = topController as? ASWebAuthenticationPresentationContextProviding {
-                        // Configurar el presentation style si es posible
-                        topController.modalPresentationStyle = .pageSheet
-                        session.presentationContextProvider = contextProvider
+                    if #available(iOS 15, *) {
+                        // Para iOS 15+ usar el método más moderno
+                        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                           let window = windowScene.windows.first,
+                           let rootVC = window.rootViewController {
+                            presentationContext = rootVC as? ASWebAuthenticationPresentationContextProviding
+                        }
                     } else {
+                        // Para iOS 13-14
+                        if let window = UIApplication.shared.windows.first,
+                           let rootVC = window.rootViewController {
+                            presentationContext = rootVC as? ASWebAuthenticationPresentationContextProviding
+                        }
+                    }
+
+                    guard let contextProvider = presentationContext else {
                         result(FlutterError.aquireRootViewControllerFailed)
                         return
                     }
 
+                    session.presentationContextProvider = contextProvider
                     session.prefersEphemeralWebBrowserSession = preferEphemeral
                 }
 
@@ -97,21 +91,18 @@ public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin {
                 result(FlutterError(code: "FAILED", message: "This plugin does currently not support iOS lower than iOS 11" , details: nil))
             }
         } else if (call.method == "cleanUpDanglingCalls") {
-            // we do not keep track of old callbacks on iOS, so nothing to do here
             result(nil)
         } else if (call.method == "warmupUrl"),
              let arguments = call.arguments as? Dictionary<String, AnyObject>,
              let urlString = arguments["url"] as? String,
              let url = URL(string: urlString)
         {
-            // no need for url warmup on iOS
             result(url.absoluteString)
         } else if (call.method == "logout"),
              let arguments = call.arguments as? Dictionary<String, AnyObject>,
              let urlString = arguments["url"] as? String,
              let url = URL(string: urlString)
         {
-            // no need for logout cleanup on iOS
             result(url.absoluteString)
         } else {
             result(FlutterMethodNotImplemented)
@@ -122,12 +113,7 @@ public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin {
 @available(iOS 13, *)
 extension FlutterViewController: ASWebAuthenticationPresentationContextProviding {
     public func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        // Mejorar el manejo del window para evitar problemas con el status bar
-        if let window = self.view.window {
-            window.windowLevel = .normal
-            return window
-        }
-        return self.view.window!
+        return self.view.window ?? UIWindow()
     }
 }
 
