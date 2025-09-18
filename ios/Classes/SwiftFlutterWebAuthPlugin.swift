@@ -1,4 +1,3 @@
-//v3
 import AuthenticationServices
 import SafariServices
 import Flutter
@@ -10,7 +9,7 @@ public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin {
         let instance = SwiftFlutterWebAuthPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
     }
-
+//v3
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         if call.method == "authenticate",
            let arguments = call.arguments as? Dictionary<String, AnyObject>,
