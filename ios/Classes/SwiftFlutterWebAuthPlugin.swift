@@ -4,9 +4,8 @@ import Flutter
 import UIKit
 
 public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin {
-    private var safariVC: SFSafariViewController?
-    private var authSession: Any?
-    
+    private var authSession: Any? // Mantener referencia fuerte
+    //v5
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "flutter_web_auth", binaryMessenger: registrar.messenger())
         let instance = SwiftFlutterWebAuthPlugin()
@@ -18,63 +17,18 @@ public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin {
            let arguments = call.arguments as? Dictionary<String, AnyObject>,
            let urlString = arguments["url"] as? String,
            let url = URL(string: urlString),
-           let callbackURLScheme = arguments["callbackUrScheme"] as? String,
+           let callbackURLScheme = arguments["callbackUrlScheme"] as? String,
            let preferEphemeral = arguments["preferEphemeral"] as? Bool
         {
-            // SOLUCIÓN ALTERNATIVA: Detectar iOS problemático y usar SFSafariViewController
-            if #available(iOS 13, *) {
-                let systemVersion = ProcessInfo.processInfo.operatingSystemVersion
-                
-                // Si es iOS 16+ donde hay problemas conocidos con ASWebAuthenticationSession
-                if systemVersion.majorVersion >= 16 {
-                    print("🔵 Usando SFSafariViewController para iOS \(systemVersion.majorVersion)")
-                    
-                    // Guardar el result para usarlo después
-                    let savedResult = result
-                    
-                    DispatchQueue.main.async {
-                        // Configurar SFSafariViewController
-                        let config = SFSafariViewController.Configuration()
-                        config.entersReaderIfAvailable = false
-                        
-                        self.safariVC = SFSafariViewController(url: url, configuration: config)
-                        self.safariVC?.modalPresentationStyle = .pageSheet
-                        
-                        if #available(iOS 15, *) {
-                            if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                               let window = windowScene.windows.first,
-                               let rootVC = window.rootViewController {
-                                
-                                // Observar URLs para detectar el callback
-                                NotificationCenter.default.addObserver(
-                                    self,
-                                    selector: #selector(self.handleCallback(_:)),
-                                    name: NSNotification.Name("FlutterWebAuthCallback"),
-                                    object: nil
-                                )
-                                
-                                rootVC.present(self.safariVC!, animated: true) {
-                                    print("✅ SFSafariViewController presentado")
-                                }
-                                
-                                // Configurar un timeout para detectar si el usuario cierra manualmente
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                                    if self.safariVC?.presentingViewController == nil {
-                                        savedResult(FlutterError(code: "CANCELED", message: "User canceled login", details: nil))
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    return
-                }
-            }
+            // Limpiar sesión anterior si existe
+            self.authSession = nil
             
-            // CÓDIGO ORIGINAL para iOS < 16
-            var sessionToKeepAlive: Any? = nil
             let completionHandler = { (url: URL?, err: Error?) in
-                sessionToKeepAlive = nil
-
+                // Limpiar la referencia después de completar
+                DispatchQueue.main.async {
+                    self.authSession = nil
+                }
+                
                 if let err = err {
                     if #available(iOS 12, *) {
                         if case ASWebAuthenticationSessionError.canceledLogin = err {
@@ -106,35 +60,87 @@ public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin {
                 let session = ASWebAuthenticationSession(url: url, callbackURLScheme: callbackURLScheme, completionHandler: completionHandler)
                 
                 if #available(iOS 13, *) {
-                    if #available(iOS 15, *) {
-                        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                           let window = windowScene.windows.first,
-                           let rootVC = window.rootViewController as? FlutterViewController {
-                            session.presentationContextProvider = rootVC
+                    // SOLUCIÓN CRÍTICA: Ejecutar todo en el main queue con delay
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        // Obtener el window correcto
+                        var window: UIWindow?
+                        
+                        if #available(iOS 15, *) {
+                            window = UIApplication.shared.connectedScenes
+                                .compactMap { $0 as? UIWindowScene }
+                                .flatMap { $0.windows }
+                                .first { $0.isKeyWindow }
+                        } else {
+                            window = UIApplication.shared.windows.first { $0.isKeyWindow }
                         }
-                    } else {
-                        if let window = UIApplication.shared.windows.first,
-                           let rootVC = window.rootViewController as? FlutterViewController {
-                            session.presentationContextProvider = rootVC
+                        
+                        guard let window = window,
+                              let rootVC = window.rootViewController else {
+                            result(FlutterError.aquireRootViewControllerFailed)
+                            return
+                        }
+                        
+                        // Buscar el FlutterViewController en la jerarquía
+                        var flutterVC: FlutterViewController?
+                        
+                        func findFlutterViewController(in viewController: UIViewController?) -> FlutterViewController? {
+                            if let vc = viewController as? FlutterViewController {
+                                return vc
+                            }
+                            
+                            if let presented = viewController?.presentedViewController {
+                                return findFlutterViewController(in: presented)
+                            }
+                            
+                            if let nav = viewController as? UINavigationController {
+                                return findFlutterViewController(in: nav.visibleViewController)
+                            }
+                            
+                            return nil
+                        }
+                        
+                        flutterVC = findFlutterViewController(in: rootVC) ?? rootVC as? FlutterViewController
+                        
+                        if let flutterVC = flutterVC {
+                            session.presentationContextProvider = flutterVC
+                        } else {
+                            // Fallback: usar el root directamente
+                            session.presentationContextProvider = rootVC as? ASWebAuthenticationPresentationContextProviding
+                        }
+                        
+                        // IMPORTANTE: NO usar preferEphemeral true en iOS 16+
+                        if #available(iOS 16, *) {
+                            session.prefersEphemeralWebBrowserSession = false
+                        } else {
+                            session.prefersEphemeralWebBrowserSession = preferEphemeral
+                        }
+                        
+                        // Iniciar la sesión
+                        if session.start() {
+                            // Mantener referencia fuerte
+                            self.authSession = session
+                            print("✅ Sesión iniciada correctamente")
+                        } else {
+                            print("❌ Error al iniciar la sesión")
+                            result(FlutterError(code: "FAILED", message: "Failed to start authentication session", details: nil))
                         }
                     }
-                    
-                    session.prefersEphemeralWebBrowserSession = preferEphemeral
+                } else {
+                    // iOS 12
+                    session.start()
+                    self.authSession = session
                 }
-                
-                session.start()
-                sessionToKeepAlive = session
-                self.authSession = session
                 
             } else if #available(iOS 11, *) {
                 let session = SFAuthenticationSession(url: url, callbackURLScheme: callbackURLScheme, completionHandler: completionHandler)
                 session.start()
-                sessionToKeepAlive = session
+                self.authSession = session
             } else {
                 result(FlutterError(code: "FAILED", message: "This plugin does currently not support iOS lower than iOS 11" , details: nil))
             }
             
         } else if (call.method == "cleanUpDanglingCalls") {
+            self.authSession = nil
             result(nil)
         } else if (call.method == "warmupUrl"),
              let arguments = call.arguments as? Dictionary<String, AnyObject>,
@@ -152,27 +158,13 @@ public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin {
             result(FlutterMethodNotImplemented)
         }
     }
-    
-    @objc private func handleCallback(_ notification: Notification) {
-        if let urlString = notification.userInfo?["url"] as? String {
-            self.safariVC?.dismiss(animated: true) {
-                // Enviar el resultado de vuelta a Flutter
-                print("✅ Callback recibido: \(urlString)")
-            }
-        }
-    }
-}
-
-// Extensión para SFSafariViewController
-extension SwiftFlutterWebAuthPlugin: SFSafariViewControllerDelegate {
-    public func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
-        print("🔵 Safari cerrado por el usuario")
-    }
 }
 
 @available(iOS 13, *)
 extension FlutterViewController: ASWebAuthenticationPresentationContextProviding {
     public func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        // Asegurar que la ventana esté lista
+        self.view.window?.makeKeyAndVisible()
         return self.view.window ?? UIWindow()
     }
 }
