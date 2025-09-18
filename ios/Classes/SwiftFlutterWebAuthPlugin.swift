@@ -1,176 +1,160 @@
-import AuthenticationServices
-import SafariServices
 import Flutter
 import UIKit
+import WebKit
 
-public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin {
-    private var authSession: Any? // Mantener referencia fuerte
-    //v5
+public class SwiftFlutterWebAuthPlugin: NSObject, FlutterPlugin, WKNavigationDelegate {
+    
+    private static var webView: WKWebView?
+    private static var webViewController: UIViewController?
+    private static var pendingResult: FlutterResult?
+    private static var callbackScheme: String?
+    
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "flutter_web_auth", binaryMessenger: registrar.messenger())
         let instance = SwiftFlutterWebAuthPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
     }
-
+    
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        if call.method == "authenticate",
-           let arguments = call.arguments as? Dictionary<String, AnyObject>,
-           let urlString = arguments["url"] as? String,
-           let url = URL(string: urlString),
-           let callbackURLScheme = arguments["callbackUrlScheme"] as? String,
-           let preferEphemeral = arguments["preferEphemeral"] as? Bool
-        {
-            // Limpiar sesión anterior si existe
-            self.authSession = nil
-            
-            let completionHandler = { (url: URL?, err: Error?) in
-                // Limpiar la referencia después de completar
-                DispatchQueue.main.async {
-                    self.authSession = nil
-                }
-                
-                if let err = err {
-                    if #available(iOS 12, *) {
-                        if case ASWebAuthenticationSessionError.canceledLogin = err {
-                            result(FlutterError(code: "CANCELED", message: "User canceled login", details: nil))
-                            return
-                        }
-                    }
-
-                    if #available(iOS 11, *) {
-                        if case SFAuthenticationError.canceledLogin = err {
-                            result(FlutterError(code: "CANCELED", message: "User canceled login", details: nil))
-                            return
-                        }
-                    }
-
-                    result(FlutterError(code: "EUNKNOWN", message: err.localizedDescription, details: nil))
-                    return
-                }
-
-                guard let url = url else {
-                    result(FlutterError(code: "EUNKNOWN", message: "URL was null, but no error provided.", details: nil))
-                    return
-                }
-
-                result(url.absoluteString)
-            }
-
-            if #available(iOS 12, *) {
-                let session = ASWebAuthenticationSession(url: url, callbackURLScheme: callbackURLScheme, completionHandler: completionHandler)
-                
-                if #available(iOS 13, *) {
-                    // SOLUCIÓN CRÍTICA: Ejecutar todo en el main queue con delay
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        // Obtener el window correcto
-                        var window: UIWindow?
-                        
-                        if #available(iOS 15, *) {
-                            window = UIApplication.shared.connectedScenes
-                                .compactMap { $0 as? UIWindowScene }
-                                .flatMap { $0.windows }
-                                .first { $0.isKeyWindow }
-                        } else {
-                            window = UIApplication.shared.windows.first { $0.isKeyWindow }
-                        }
-                        
-                        guard let window = window,
-                              let rootVC = window.rootViewController else {
-                            result(FlutterError.aquireRootViewControllerFailed)
-                            return
-                        }
-                        
-                        // Buscar el FlutterViewController en la jerarquía
-                        var flutterVC: FlutterViewController?
-                        
-                        func findFlutterViewController(in viewController: UIViewController?) -> FlutterViewController? {
-                            if let vc = viewController as? FlutterViewController {
-                                return vc
-                            }
-                            
-                            if let presented = viewController?.presentedViewController {
-                                return findFlutterViewController(in: presented)
-                            }
-                            
-                            if let nav = viewController as? UINavigationController {
-                                return findFlutterViewController(in: nav.visibleViewController)
-                            }
-                            
-                            return nil
-                        }
-                        
-                        flutterVC = findFlutterViewController(in: rootVC) ?? rootVC as? FlutterViewController
-                        
-                        if let flutterVC = flutterVC {
-                            session.presentationContextProvider = flutterVC
-                        } else {
-                            // Fallback: usar el root directamente
-                            session.presentationContextProvider = rootVC as? ASWebAuthenticationPresentationContextProviding
-                        }
-                        
-                        // IMPORTANTE: NO usar preferEphemeral true en iOS 16+
-                        if #available(iOS 16, *) {
-                            session.prefersEphemeralWebBrowserSession = false
-                        } else {
-                            session.prefersEphemeralWebBrowserSession = preferEphemeral
-                        }
-                        
-                        // Iniciar la sesión
-                        if session.start() {
-                            // Mantener referencia fuerte
-                            self.authSession = session
-                            print("✅ Sesión iniciada correctamente")
-                        } else {
-                            print("❌ Error al iniciar la sesión")
-                            result(FlutterError(code: "FAILED", message: "Failed to start authentication session", details: nil))
-                        }
-                    }
-                } else {
-                    // iOS 12
-                    session.start()
-                    self.authSession = session
-                }
-                
-            } else if #available(iOS 11, *) {
-                let session = SFAuthenticationSession(url: url, callbackURLScheme: callbackURLScheme, completionHandler: completionHandler)
-                session.start()
-                self.authSession = session
-            } else {
-                result(FlutterError(code: "FAILED", message: "This plugin does currently not support iOS lower than iOS 11" , details: nil))
+        if call.method == "authenticate" {
+            guard let arguments = call.arguments as? Dictionary<String, AnyObject>,
+                  let urlString = arguments["url"] as? String,
+                  let url = URL(string: urlString),
+                  let callbackURLScheme = arguments["callbackUrlScheme"] as? String else {
+                result(FlutterError(code: "INVALID_ARGS", message: "Invalid arguments", details: nil))
+                return
             }
             
-        } else if (call.method == "cleanUpDanglingCalls") {
-            self.authSession = nil
+            SwiftFlutterWebAuthPlugin.pendingResult = result
+            SwiftFlutterWebAuthPlugin.callbackScheme = callbackURLScheme
+            
+            DispatchQueue.main.async {
+                let config = WKWebViewConfiguration()
+                config.preferences.javaScriptEnabled = true
+                
+                let webView = WKWebView(frame: UIScreen.main.bounds, configuration: config)
+                webView.navigationDelegate = self
+                // Agregar User-Agent para evitar detección
+                webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+                
+                let webViewController = UIViewController()
+                webViewController.view = webView
+                webViewController.modalPresentationStyle = .pageSheet
+                
+                // Agregar navbar con botón cancelar
+                let navController = UINavigationController(rootViewController: webViewController)
+                webViewController.navigationItem.leftBarButtonItem = UIBarButtonItem(
+                    barButtonSystemItem: .cancel,
+                    target: self,
+                    action: #selector(self.closeWebView)
+                )
+                webViewController.title = "Connexion" // Título opcional
+                
+                SwiftFlutterWebAuthPlugin.webView = webView
+                SwiftFlutterWebAuthPlugin.webViewController = navController
+                
+                webView.load(URLRequest(url: url))
+                
+                if let windowScene = UIApplication.shared.connectedScenes
+                    .compactMap({ $0 as? UIWindowScene })
+                    .first(where: { $0.activationState == .foregroundActive }),
+                   let window = windowScene.windows.first(where: { $0.isKeyWindow }),
+                   let rootVC = window.rootViewController {
+                    
+                    rootVC.present(navController, animated: true)
+                }
+            }
+            
+        } else if call.method == "cleanUpDanglingCalls" {
+            // Limpiar cualquier sesión pendiente
+            self.cleanup()
             result(nil)
-        } else if (call.method == "warmupUrl"),
-             let arguments = call.arguments as? Dictionary<String, AnyObject>,
-             let urlString = arguments["url"] as? String,
-             let url = URL(string: urlString)
-        {
-            result(url.absoluteString)
-        } else if (call.method == "logout"),
-             let arguments = call.arguments as? Dictionary<String, AnyObject>,
-             let urlString = arguments["url"] as? String,
-             let url = URL(string: urlString)
-        {
-            result(url.absoluteString)
+            
+        } else if call.method == "warmupUrl" {
+            // Pre-cargar URL para mejorar performance
+            if let arguments = call.arguments as? Dictionary<String, AnyObject>,
+               let urlString = arguments["url"] as? String,
+               let url = URL(string: urlString) {
+                // Pre-cargar en background
+                let request = URLRequest(url: url)
+                URLSession.shared.dataTask(with: request) { _, _, _ in }.resume()
+                result(urlString)
+            } else {
+                result(nil)
+            }
+            
+        } else if call.method == "logout" {
+            // Limpiar cookies para logout
+            if let arguments = call.arguments as? Dictionary<String, AnyObject>,
+               let urlString = arguments["url"] as? String {
+                
+                // Limpiar cookies del dominio
+                let dataStore = WKWebsiteDataStore.default()
+                dataStore.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
+                    dataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), 
+                                       for: records) {
+                        result(urlString)
+                    }
+                }
+            } else {
+                result(nil)
+            }
+            
         } else {
             result(FlutterMethodNotImplemented)
         }
     }
-}
-
-@available(iOS 13, *)
-extension FlutterViewController: ASWebAuthenticationPresentationContextProviding {
-    public func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        // Asegurar que la ventana esté lista
-        self.view.window?.makeKeyAndVisible()
-        return self.view.window ?? UIWindow()
+    
+    // WKNavigationDelegate - Interceptar navegación
+    public func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        
+        if let url = navigationAction.request.url,
+           let scheme = url.scheme,
+           let callbackScheme = SwiftFlutterWebAuthPlugin.callbackScheme,
+           scheme == callbackScheme {
+            
+            // Encontramos el callback
+            SwiftFlutterWebAuthPlugin.webViewController?.dismiss(animated: true) {
+                SwiftFlutterWebAuthPlugin.pendingResult?(url.absoluteString)
+                self.cleanup()
+            }
+            decisionHandler(.cancel)
+            return
+        }
+        
+        decisionHandler(.allow)
+    }
+    
+    // Manejar errores de carga
+    public func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        SwiftFlutterWebAuthPlugin.pendingResult?(FlutterError(code: "LOAD_ERROR", 
+                                                              message: error.localizedDescription, 
+                                                              details: nil))
+        self.cleanup()
+    }
+    
+    @objc private func closeWebView() {
+        SwiftFlutterWebAuthPlugin.webViewController?.dismiss(animated: true) {
+            SwiftFlutterWebAuthPlugin.pendingResult?(FlutterError(code: "CANCELED", 
+                                                                  message: "User canceled login", 
+                                                                  details: nil))
+            self.cleanup()
+        }
+    }
+    
+    private func cleanup() {
+        SwiftFlutterWebAuthPlugin.webView = nil
+        SwiftFlutterWebAuthPlugin.webViewController = nil
+        SwiftFlutterWebAuthPlugin.pendingResult = nil
+        SwiftFlutterWebAuthPlugin.callbackScheme = nil
     }
 }
 
+// Extensión para compatibilidad con el código anterior
 fileprivate extension FlutterError {
     static var aquireRootViewControllerFailed: FlutterError {
-        return FlutterError(code: "AQUIRE_ROOT_VIEW_CONTROLLER_FAILED", message: "Failed to aquire root view controller" , details: nil)
+        return FlutterError(code: "AQUIRE_ROOT_VIEW_CONTROLLER_FAILED", 
+                          message: "Failed to aquire root view controller", 
+                          details: nil)
     }
 }
